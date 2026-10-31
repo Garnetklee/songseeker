@@ -8,6 +8,18 @@ let csvCache = {};
 let lastDecodedText = ""; // Store the last decoded text
 let currentStartTime = 0;
 
+// Own cards: the QR code contains <base URL>?c=<set>-<number>, e.g. ?c=ktv01-042
+// The number is looked up in playlists/<set>.csv (same format as the Hitster playlists).
+const CARD_REGEX = /^([a-z0-9]+)-(\d{1,4})$/i;
+let currentCard = null; // name of the own card being played, null for other links (then title may be shown)
+let pendingCard = null; // card from the page URL (scanned with the normal camera app), loaded once the player is ready
+
+// Card from the page's own URL (case B): remember it and clean the address bar
+if (new URLSearchParams(window.location.search).get('c')) {
+    pendingCard = window.location.href;
+    history.replaceState(null, "", window.location.pathname);
+}
+
 // Function to detect iOS devices
 function isIOS() {
     return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
@@ -43,14 +55,28 @@ document.addEventListener('DOMContentLoaded', function () {
 // Function to determine the type of link and act accordingly
 async function handleScannedLink(decodedText) {
     let youtubeURL = "";
-    if (isYoutubeLink(decodedText)) {
+    const card = isYoutubeLink(decodedText) ? null : parseCardLink(decodedText);
+    currentCard = card ? card.name : null;
+    showMessage("");
+    if (card) {
+        try {
+            const csvContent = await getCachedCsv(`playlists/${card.set}.csv`);
+            youtubeURL = lookupYoutubeLink(card.nr, csvContent) || "";
+        } catch (error) {
+            console.error("Failed to fetch CSV:", error);
+        }
+        if (!parseYoutubeLink(youtubeURL)) {
+            showMessage(`Karte ${card.name} nicht gefunden.`, true);
+            return;
+        }
+    } else if (isYoutubeLink(decodedText)) {
         youtubeURL = decodedText;
     } else if (isHitsterLink(decodedText)) {
         const hitsterData = parseHitsterUrl(decodedText);
         if (hitsterData) {
             console.log("Hitster data:", hitsterData.id, hitsterData.lang);
             try {
-                const csvContent = await getCachedCsv(`/playlists/hitster-${hitsterData.lang}.csv`);
+                const csvContent = await getCachedCsv(`playlists/hitster-${hitsterData.lang}.csv`);
                 const youtubeLink = lookupYoutubeLink(hitsterData.id, csvContent);
                 if (youtubeLink) {
                     // Handle YouTube link obtained from the CSV
@@ -89,15 +115,50 @@ async function handleScannedLink(decodedText) {
         document.getElementById('cancelScanButton').style.display = 'none'; // Hide the cancel-button
         lastDecodedText = ""; // Reset the last decoded text
 
-        document.getElementById('video-id').textContent = youtubeLinkData.videoId;  
+        // never reveal anything about own cards
+        document.getElementById('video-id').textContent = currentCard ? "" : youtubeLinkData.videoId;
+        document.getElementById('startstop-video').classList.toggle('big', currentCard !== null);
+        if (currentCard) {
+            showMessage(`Karte ${currentCard} geladen`);
+        }
 
         console.log(youtubeLinkData.videoId);
         currentStartTime = youtubeLinkData.startTime || 0;
-        player.cueVideoById(youtubeLinkData.videoId, currentStartTime);   
-        
+        player.cueVideoById(youtubeLinkData.videoId, currentStartTime);
+
     }
-    
+
 }
+
+    // Own card link: any URL whose parameter c looks like "ktv01-042" (case-insensitive)
+    function parseCardLink(text) {
+        let url;
+        try {
+            url = new URL(text);
+        } catch (error) {
+            return null;
+        }
+        const c = url.searchParams.get('c');
+        const match = c ? c.trim().match(CARD_REGEX) : null;
+        if (!match) {
+            return null;
+        }
+        const set = match[1].toLowerCase();
+        return { set: set, nr: match[2], name: `${set}-${match[2]}` };
+    }
+
+    function showMessage(text, isError = false) {
+        const element = document.getElementById('card-message');
+        element.textContent = text;
+        element.classList.toggle('error', isError);
+    }
+
+    // Lock screen / media notification: show only the card name
+    function setCardMediaSession() {
+        if (currentCard && 'mediaSession' in navigator && 'MediaMetadata' in window) {
+            navigator.mediaSession.metadata = new MediaMetadata({ title: `Karte ${currentCard}`, artist: "SongSeeker" });
+        }
+    }
 
     function isHitsterLink(url) {
         // Regular expression to match with or without "http://" or "https://"
@@ -177,7 +238,11 @@ async function handleScannedLink(decodedText) {
     async function getCachedCsv(url) {
         if (!csvCache[url]) { // Check if the URL is not in the cache
             console.log(`URL not cached, fetching CSV from URL: ${url}`);
-            const response = await fetch(url);
+            // no-cache: the browser revalidates, so updated playlists arrive immediately
+            const response = await fetch(url, { cache: "no-cache" });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status} for ${url}`);
+            }
             const data = await response.text();
             csvCache[url] = parseCSV(data); // Cache the parsed CSV data using the URL as a key
         }
@@ -228,7 +293,8 @@ function onYouTubeIframeAPIReady() {
         width: '0',
         events: {
             'onReady': onPlayerReady,
-            'onStateChange': onPlayerStateChange
+            'onStateChange': onPlayerStateChange,
+            'onError': onPlayerError
         }
     });
 }
@@ -246,17 +312,36 @@ function onPlayerReady(event) {
     // player.cueVideoById('dQw4w9WgXcQ');
     event.target.setVolume(100);
     event.target.unMute();
+    if (pendingCard) {
+        handleScannedLink(pendingCard);
+        pendingCard = null;
+    }
+}
+
+// Video deleted, private or not embeddable (codes 100/101/150)
+function onPlayerError(event) {
+    console.error("YouTube player error:", event.data);
+    document.getElementById('startstop-video').innerHTML = "Play";
+    document.getElementById('startstop-video').style.background = "";
+    if (currentCard) {
+        showMessage(`Karte ${currentCard} kann nicht abgespielt werden (Fehler ${event.data}).`, true);
+    }
 }
 
 // Display video information when it's cued
 function onPlayerStateChange(event) {
     if (event.data == YT.PlayerState.CUED) {
         document.getElementById('startstop-video').style.background = "green";
-        // Display title and duration
-        var videoData = player.getVideoData();
-        document.getElementById('video-title').textContent = videoData.title;
-        var duration = player.getDuration();
-        document.getElementById('video-duration').textContent = formatDuration(duration);
+        // Display title and duration (never for own cards)
+        if (currentCard) {
+            document.getElementById('video-title').textContent = "";
+            document.getElementById('video-duration').textContent = "";
+        } else {
+            var videoData = player.getVideoData();
+            document.getElementById('video-title').textContent = videoData.title;
+            var duration = player.getDuration();
+            document.getElementById('video-duration').textContent = formatDuration(duration);
+        }
         // We do need this on iOS devices otherwise one would need to press play twice
         if (isIOS()) {
             player.playVideo();
@@ -274,6 +359,7 @@ function onPlayerStateChange(event) {
     }
     else if (event.data == YT.PlayerState.PLAYING) {
         document.getElementById('startstop-video').style.background = "red";
+        setCardMediaSession();
     }
     else if (event.data == YT.PlayerState.PAUSED || event.data == YT.PlayerState.ENDED) {
         document.getElementById('startstop-video').innerHTML = "Play";

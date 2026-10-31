@@ -289,3 +289,28 @@ label {
     padding: 0.6rem 0;
   }
 }
+
+/* Own cards (?c=ktv01-042): status line and big play button */
+.card-message {
+  margin: 0.8rem auto;
+  max-width: 90vw;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.card-message:empty {
+  display: none;
+}
+
+.card-message.error {
+  background: rgba(200, 0, 0, 0.45);
+  border-radius: 0.6rem;
+  padding: 0.5rem 0.8rem;
+}
+
+.button_startstop.big {
+  width: 60vw;
+  max-width: 18rem;
+  height: 4rem;
+  font-size: 1.6rem;
+}
